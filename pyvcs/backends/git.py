@@ -4,7 +4,6 @@ import os
 
 from dulwich.repo import Repo
 from dulwich import objects
-from dulwich.errors import NotCommitError
 
 from pyvcs.commit import Commit
 from pyvcs.exceptions import CommitDoesNotExist, FileDoesNotExist, FolderDoesNotExist
@@ -24,9 +23,9 @@ def get_differing_files(repo, past, current):
     past_files = {}
     current_files = {}
     if past is not None:
-        past_files = dict([(name, sha) for mode, name, sha in past.entries()])
+        past_files = dict([(name, content[1]) for name, content in past._entries.items()])
     if current is not None:
-        current_files = dict([(name, sha) for mode, name, sha in current.entries()])
+        current_files = dict([(name, content[1]) for name, content in current._entries.items()])
 
     added = set(current_files) - set(past_files)
     removed = set(past_files) - set(current_files)
@@ -64,7 +63,8 @@ class Repository(BaseRepository):
 
     def _get_commit(self, commit_id):
         try:
-            return self._repo[commit_id]
+            #return self._repo.commit(commit_id)
+            return self._repo.get_object(commit_id)
         except Exception, e:
             raise CommitDoesNotExist("%s is not a commit" % commit_id)
 
@@ -72,40 +72,34 @@ class Repository(BaseRepository):
         return self._repo.get_object(sha)
 
     def _diff_files(self, commit_id1, commit_id2):
-        if commit_id1 == 'NULL':
-            commit_id1 = None
-        if commit_id2 == 'NULL':
-            commit_id2 = None
-        tree1 = self._get_obj(self._get_obj(commit_id1).tree) if commit_id1 else None
-        tree2 = self._get_obj(self._get_obj(commit_id2).tree) if commit_id2 else None
         return sorted(get_differing_files(
             self._repo,
-            tree1,
-            tree2,
+            self._get_obj(self._get_obj(commit_id1).tree),
+            self._get_obj(self._get_obj(commit_id2).tree),
         ))
 
     def get_commit_by_id(self, commit_id):
         commit = self._get_commit(commit_id)
-        parent = commit.parents[0] if len(commit.parents) else 'NULL'
-        files = self._diff_files(commit.id, parent)
+        files = self._diff_files(commit.id, commit.parents[0])
         return Commit(commit.id, commit.committer,
             datetime.fromtimestamp(commit.commit_time), commit.message, files,
-            lambda: generate_unified_diff(self, files, parent, commit.id))
+            generate_unified_diff(self, files, commit.parents[0], commit.id))
 
     def get_recent_commits(self, since=None):
         if since is None:
-            #since = datetime.fromtimestamp(self._repo.commit(self._repo.head()).commit_time) - timedelta(days=5)
-            since = datetime.fromtimestamp(self._repo[self._repo.head()].commit_time) - timedelta(days=5)
+            since = datetime.now() - timedelta(days=5)
         pending_commits = self._repo.get_refs().values()#[self._repo.head()]
+        walker = self._repo.get_graph_walker()
         history = {}
         while pending_commits:
             head = pending_commits.pop(0)
             try:
-                commit = self._repo[head]
+                #commit = self._repo.commit(head)
+                cset = walker.next()
+                commit = self._repo.get_object(cset)
             except KeyError:
                 raise CommitDoesNotExist
-            if not isinstance(commit, objects.Commit) or commit.id in history or\
-               datetime.fromtimestamp(commit.commit_time) <= since:
+            if commit.id in history or datetime.fromtimestamp(commit.commit_time) <= since:
                 continue
             history[commit.id] = commit
             pending_commits.extend(commit.parents)
@@ -114,49 +108,42 @@ class Repository(BaseRepository):
         return sorted(commits, key=attrgetter('time'), reverse=True)
 
     def list_directory(self, path, revision=None):
-        if revision is None:
-            commit = self._get_commit(self._repo.head())
-        elif revision is 'NULL':
-            return ([],[])
-        else:
-            commit = self._get_commit(revision)
-        tree = self._repo[commit.tree]
+        commit = self._get_commit(revision or self._repo.head())
+        tree  = self._repo.get_object(commit.tree)
         path = filter(bool, path.split(os.path.sep))
         while path:
             part = path.pop(0)
             found = False
-            for mode, name, hexsha in self._repo[tree.id].entries():
+            #for mode, name, hexsha in self._repo.tree(tree.id).entries():
+            for name,content in tree._entries.items():
                 if part == name:
                     found = True
-                    tree = self._repo[hexsha]
+                    tree = self._repo.get_object(content[1])
                     break
             if not found:
                 raise FolderDoesNotExist
         files, folders = [], []
-        for mode, name, hexsha in tree.entries():
-            if isinstance(self._repo.get_object(hexsha), objects.Tree):
+        for name,content in tree._entries.items():
+            if isinstance(self._repo.get_object(content[1]), objects.Tree):
                 folders.append(name)
-            elif isinstance(self._repo.get_object(hexsha), objects.Blob):
+            elif isinstance(self._repo.get_object(content[1]), objects.Blob):
                 files.append(name)
         return files, folders
 
     def file_contents(self, path, revision=None):
-        if revision is None:
-            commit = self._get_commit(self._repo.head())
-        elif revision is 'NULL':
-            return ''
-        else:
-            commit = self._get_commit(revision)
-        tree = self._repo[commit.tree]
+        commit = self._get_commit(revision or self._repo.head())
+
+        tree  = self._repo.get_object(commit.tree)
         path = path.split(os.path.sep)
         path, filename = path[:-1], path[-1]
         while path:
             part = path.pop(0)
-            for mode, name, hexsha in self._repo[tree.id].entries():
+            #for mode, name, hexsha in self._repo.tree(tree.id).entries():
+            for name,content in tree._entries.items():
                 if part == name:
-                    tree = self._repo[hexsha]
+                    tree = self._repo.get_object(content[1])
                     break
-        for mode, name, hexsha in tree.entries():
+        for name, content in tree._entries.items():
             if name == filename:
-                return self._repo[hexsha].as_pretty_string()
+                return self._repo.get_object(content[1]).as_pretty_string()
         raise FileDoesNotExist
